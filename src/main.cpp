@@ -32,12 +32,14 @@ constexpr UINT_PTR kShowCommand = 1001;
 constexpr UINT_PTR kOpenCommand = 1002;
 constexpr UINT_PTR kPauseCommand = 1003;
 constexpr UINT_PTR kExitCommand = 1004;
+constexpr UINT_PTR kAudioCommand = 1005;
 
 constexpr int kPathEditId = 2001;
 constexpr int kBrowseButtonId = 2002;
 constexpr int kApplyButtonId = 2003;
 constexpr int kPauseButtonId = 2004;
 constexpr int kExitButtonId = 2005;
+constexpr int kAudioCheckId = 2006;
 
 constexpr UINT kExplorerSpawnWorkerMessage = 0x052C;
 
@@ -48,11 +50,13 @@ HWND g_wallpaperHost = nullptr;
 HWND g_pathEdit = nullptr;
 HWND g_statusLabel = nullptr;
 HWND g_pauseButton = nullptr;
+HWND g_audioCheck = nullptr;
 IMFPMediaPlayer* g_player = nullptr;
 NOTIFYICONDATAW g_trayIcon{};
 UINT g_taskbarCreatedMessage = 0;
 bool g_restartPending = false;
 bool g_isExiting = false;
+bool g_audioEnabled = false;
 std::wstring g_currentPath;
 std::wstring g_selectedPath;
 
@@ -232,6 +236,17 @@ void SaveCurrentPath(const std::wstring& path) {
     }
 }
 
+void SaveAudioEnabled(bool enabled) {
+    const std::filesystem::path settings = SettingsPath();
+    if (!settings.empty()) {
+        WritePrivateProfileStringW(
+            L"playback",
+            L"audio_enabled",
+            enabled ? L"1" : L"0",
+            settings.c_str());
+    }
+}
+
 std::wstring LoadCurrentPath() {
     const std::filesystem::path settings = SettingsPath();
     if (settings.empty()) {
@@ -247,6 +262,14 @@ std::wstring LoadCurrentPath() {
         static_cast<DWORD>(value.size()),
         settings.c_str());
     return value.data();
+}
+
+bool LoadAudioEnabled() {
+    const std::filesystem::path settings = SettingsPath();
+    if (settings.empty()) {
+        return false;
+    }
+    return GetPrivateProfileIntW(L"playback", L"audio_enabled", 0, settings.c_str()) != 0;
 }
 
 bool IsMp4Path(const std::wstring& path) {
@@ -411,13 +434,7 @@ HRESULT InspectMediaItem(IMFPMediaItem* item) {
             continue;
         }
 
-        if (*majorType.puuid == MFMediaType_Audio) {
-            const HRESULT disableResult = item->SetStreamSelection(index, FALSE);
-            if (FAILED(disableResult)) {
-                PropVariantClear(&majorType);
-                return disableResult;
-            }
-        } else if (*majorType.puuid == MFMediaType_Video) {
+        if (*majorType.puuid == MFMediaType_Video) {
             PROPVARIANT subtype{};
             PropVariantInit(&subtype);
             if (SUCCEEDED(item->GetStreamAttribute(index, MF_MT_SUBTYPE, &subtype)) &&
@@ -519,6 +536,10 @@ void UpdateControls() {
             state == MFP_MEDIAPLAYER_STATE_PLAYING ? L"一時停止" : L"再生");
     }
 
+    if (g_audioCheck != nullptr) {
+        SendMessageW(g_audioCheck, BM_SETCHECK, g_audioEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
+    }
+
     if (g_player == nullptr) {
         SetStatus(L"状態: 動画が設定されていない");
     } else if (state == MFP_MEDIAPLAYER_STATE_PLAYING) {
@@ -600,6 +621,9 @@ bool CreateControlChildren(HWND window) {
     HWND exitButton = CreateWindowExW(
         0, L"BUTTON", L"終了", buttonStyle,
         290, 86, 90, 34, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kExitButtonId)), g_instance, nullptr);
+    g_audioCheck = CreateWindowExW(
+        0, L"BUTTON", L"音声を再生", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+        400, 91, 150, 24, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kAudioCheckId)), g_instance, nullptr);
     g_statusLabel = CreateWindowExW(
         0, L"STATIC", L"状態: 動画が設定されていない", labelStyle,
         20, 138, 586, 22, window, nullptr, g_instance, nullptr);
@@ -615,6 +639,7 @@ bool CreateControlChildren(HWND window) {
         applyButton,
         g_pauseButton,
         exitButton,
+        g_audioCheck,
         g_statusLabel,
         hintLabel,
     };
@@ -665,6 +690,22 @@ void TogglePlayback() {
     }
 }
 
+void ToggleAudio() {
+    const bool nextAudioEnabled = !g_audioEnabled;
+    if (g_player != nullptr) {
+        const HRESULT result = g_player->SetMute(nextAudioEnabled ? FALSE : TRUE);
+        if (FAILED(result)) {
+            ShowError(L"音声設定を変更できなかった。", result);
+            UpdateControls();
+            return;
+        }
+    }
+
+    g_audioEnabled = nextAudioEnabled;
+    SaveAudioEnabled(g_audioEnabled);
+    UpdateControls();
+}
+
 void AddTrayIcon() {
     g_trayIcon = {};
     g_trayIcon.cbSize = sizeof(g_trayIcon);
@@ -701,6 +742,7 @@ void ShowTrayMenu() {
     AppendMenuW(menu, MF_STRING | MF_DEFAULT, kShowCommand, L"設定を開く");
     AppendMenuW(menu, MF_STRING, kOpenCommand, L"MP4を選択...");
     AppendMenuW(menu, MF_STRING | (g_player == nullptr ? MF_GRAYED : 0), kPauseCommand, pauseLabel);
+    AppendMenuW(menu, MF_STRING | (g_audioEnabled ? MF_CHECKED : 0), kAudioCommand, L"音声を再生");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kExitCommand, L"終了");
 
@@ -726,6 +768,9 @@ void ShowTrayMenu() {
         break;
     case kPauseCommand:
         TogglePlayback();
+        break;
+    case kAudioCommand:
+        ToggleAudio();
         break;
     case kExitCommand:
         g_isExiting = true;
@@ -785,6 +830,9 @@ LRESULT CALLBACK ControlWindowProcedure(HWND window, UINT message, WPARAM wParam
         case kPauseButtonId:
             TogglePlayback();
             break;
+        case kAudioCheckId:
+            ToggleAudio();
+            break;
         case kExitButtonId:
             g_isExiting = true;
             DestroyWindow(window);
@@ -827,7 +875,7 @@ LRESULT CALLBACK ControlWindowProcedure(HWND window, UINT message, WPARAM wParam
         return 0;
     case kMediaItemSetMessage:
         if (reinterpret_cast<IMFPMediaPlayer*>(wParam) == g_player) {
-            HRESULT result = g_player->SetMute(TRUE);
+            HRESULT result = g_player->SetMute(g_audioEnabled ? FALSE : TRUE);
             if (SUCCEEDED(result)) {
                 result = g_player->SetAspectRatioMode(MFVideoARMode_PreservePicture);
             }
@@ -915,6 +963,8 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int showCommand) 
         CoUninitialize();
         return 1;
     }
+
+    g_audioEnabled = LoadAudioEnabled();
 
     WNDCLASSEXW wallpaperClass{};
     wallpaperClass.cbSize = sizeof(wallpaperClass);

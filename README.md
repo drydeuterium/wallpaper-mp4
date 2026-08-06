@@ -2,7 +2,7 @@
 
 H.264 MP4をWindowsデスクトップの壁紙としてループ再生する、軽量な常駐アプリ。
 
-Web表示、プラグイン、インタラクション、音声再生は持たず、Windows標準のMedia Foundationを利用する。
+Web表示、プラグイン、インタラクションを持たず、Windows標準のMedia Foundationを利用する。音声は既定でオフ。
 
 ## ダウンロード
 
@@ -15,23 +15,24 @@ Web表示、プラグイン、インタラクション、音声再生は持た�
 1. `wallpaper-mp4.exe`を起動する
 2. 「参照...」からH.264 MP4を選ぶ
 3. 「壁紙に設定」を押す
-4. 最小化または×でタスクトレイへ格納する
+4. 音声が必要なら「音声を再生」をオンにする
+5. 最小化または×でタスクトレイへ格納する
 
-タスクトレイのアイコンをダブルクリックすると設定画面を再表示する。右クリックメニューから動画変更、一時停止、再生、終了も行える。
+タスクトレイのアイコンをダブルクリックすると設定画面を再表示する。右クリックメニューから動画変更、一時停止、再生、音声切り替え、終了も行える。
 
-最後に選んだMP4は次回起動時に自動再生する。設定は `%LOCALAPPDATA%\wallpaper-mp4\settings.ini` に保存し、動画ファイル自体はコピーしない。
+最後に選んだMP4と音声設定は次回起動時にも引き継ぐ。設定は `%LOCALAPPDATA%\wallpaper-mp4\settings.ini` に保存し、動画ファイル自体はコピーしない。
 
 ## 対応動画
 
 - コンテナ：MP4
 - 映像：H.264
 - 推奨：8-bit、4:2:0、ディスプレイと同じ解像度、30 fps
-- 音声：再生しない
+- 音声：オン／オフ切り替え可能。対応形式はWindows Media Foundationに依存
 
 FFmpegでの変換例：
 
 ```powershell
-ffmpeg -i input.mp4 -an -vf fps=30 -c:v libx264 -preset medium -crf 20 -pix_fmt yuv420p -movflags +faststart output.mp4
+ffmpeg -i input.mp4 -vf fps=30 -c:v libx264 -preset medium -crf 20 -pix_fmt yuv420p -c:a aac -b:a 192k -movflags +faststart output.mp4
 ```
 
 ## ビルド
