@@ -17,7 +17,8 @@
 
 namespace {
 
-constexpr wchar_t kWindowClassName[] = L"WallpaperMp4Window";
+constexpr wchar_t kControlWindowClassName[] = L"WallpaperMp4ControlWindow";
+constexpr wchar_t kWallpaperWindowClassName[] = L"WallpaperMp4Window";
 constexpr wchar_t kApplicationName[] = L"wallpaper-mp4";
 
 constexpr UINT kTrayMessage = WM_APP + 1;
@@ -25,21 +26,35 @@ constexpr UINT kPlaybackEndedMessage = WM_APP + 2;
 constexpr UINT kPositionSetMessage = WM_APP + 3;
 constexpr UINT kPlaybackErrorMessage = WM_APP + 4;
 constexpr UINT kMediaItemSetMessage = WM_APP + 5;
+constexpr UINT kPlaybackStateMessage = WM_APP + 6;
 
-constexpr UINT_PTR kOpenCommand = 1001;
-constexpr UINT_PTR kPauseCommand = 1002;
-constexpr UINT_PTR kExitCommand = 1003;
+constexpr UINT_PTR kShowCommand = 1001;
+constexpr UINT_PTR kOpenCommand = 1002;
+constexpr UINT_PTR kPauseCommand = 1003;
+constexpr UINT_PTR kExitCommand = 1004;
+
+constexpr int kPathEditId = 2001;
+constexpr int kBrowseButtonId = 2002;
+constexpr int kApplyButtonId = 2003;
+constexpr int kPauseButtonId = 2004;
+constexpr int kExitButtonId = 2005;
 
 constexpr UINT kExplorerSpawnWorkerMessage = 0x052C;
 
 HINSTANCE g_instance = nullptr;
-HWND g_window = nullptr;
+HWND g_controlWindow = nullptr;
+HWND g_wallpaperWindow = nullptr;
 HWND g_wallpaperHost = nullptr;
+HWND g_pathEdit = nullptr;
+HWND g_statusLabel = nullptr;
+HWND g_pauseButton = nullptr;
 IMFPMediaPlayer* g_player = nullptr;
 NOTIFYICONDATAW g_trayIcon{};
 UINT g_taskbarCreatedMessage = 0;
 bool g_restartPending = false;
+bool g_isExiting = false;
 std::wstring g_currentPath;
+std::wstring g_selectedPath;
 
 void ShowError(const std::wstring& message, HRESULT result = S_OK);
 
@@ -132,6 +147,15 @@ public:
                 reinterpret_cast<WPARAM>(eventHeader->pMediaPlayer),
                 0);
             break;
+        case MFP_EVENT_TYPE_PLAY:
+        case MFP_EVENT_TYPE_PAUSE:
+        case MFP_EVENT_TYPE_STOP:
+            PostMessageW(
+                window,
+                kPlaybackStateMessage,
+                reinterpret_cast<WPARAM>(eventHeader->pMediaPlayer),
+                0);
+            break;
         default:
             break;
         }
@@ -181,7 +205,7 @@ void ShowError(const std::wstring& message, HRESULT result) {
         completeMessage += L"\n\n";
         completeMessage += FormatSystemMessage(result);
     }
-    MessageBoxW(nullptr, completeMessage.c_str(), kApplicationName, MB_OK | MB_ICONERROR);
+    MessageBoxW(g_controlWindow, completeMessage.c_str(), kApplicationName, MB_OK | MB_ICONERROR);
 }
 
 std::filesystem::path SettingsPath() {
@@ -238,13 +262,13 @@ bool IsExistingFile(const std::wstring& path) {
     return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
 }
 
-std::wstring PickMp4File() {
+std::wstring PickMp4File(HWND owner) {
     std::vector<wchar_t> fileName(32768);
     constexpr wchar_t filter[] = L"MP4 video (*.mp4)\0*.mp4\0All files (*.*)\0*.*\0\0";
 
     OPENFILENAMEW dialog{};
     dialog.lStructSize = sizeof(dialog);
-    dialog.hwndOwner = nullptr;
+    dialog.hwndOwner = owner;
     dialog.lpstrFilter = filter;
     dialog.lpstrFile = fileName.data();
     dialog.nMaxFile = static_cast<DWORD>(fileName.size());
@@ -309,17 +333,17 @@ HWND WallpaperInsertAfter(HWND host) {
 
 bool AttachToDesktop() {
     HWND host = FindWallpaperHost();
-    if (host == nullptr || g_window == nullptr) {
+    if (host == nullptr || g_wallpaperWindow == nullptr) {
         return false;
     }
 
-    LONG_PTR style = GetWindowLongPtrW(g_window, GWL_STYLE);
+    LONG_PTR style = GetWindowLongPtrW(g_wallpaperWindow, GWL_STYLE);
     style &= ~static_cast<LONG_PTR>(WS_POPUP);
     style |= WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
-    SetWindowLongPtrW(g_window, GWL_STYLE, style);
+    SetWindowLongPtrW(g_wallpaperWindow, GWL_STYLE, style);
 
     SetLastError(ERROR_SUCCESS);
-    const HWND previousParent = SetParent(g_window, host);
+    const HWND previousParent = SetParent(g_wallpaperWindow, host);
     if (previousParent == nullptr && GetLastError() != ERROR_SUCCESS) {
         return false;
     }
@@ -333,7 +357,7 @@ bool AttachToDesktop() {
 
     g_wallpaperHost = host;
     SetWindowPos(
-        g_window,
+        g_wallpaperWindow,
         WallpaperInsertAfter(host),
         corners[0].x,
         corners[0].y,
@@ -344,7 +368,7 @@ bool AttachToDesktop() {
 }
 
 void ResizeForPrimaryMonitor() {
-    if (g_window == nullptr || g_wallpaperHost == nullptr || !IsWindow(g_wallpaperHost)) {
+    if (g_wallpaperWindow == nullptr || g_wallpaperHost == nullptr || !IsWindow(g_wallpaperHost)) {
         AttachToDesktop();
         return;
     }
@@ -356,7 +380,7 @@ void ResizeForPrimaryMonitor() {
     };
     MapWindowPoints(HWND_DESKTOP, g_wallpaperHost, corners, 2);
     SetWindowPos(
-        g_window,
+        g_wallpaperWindow,
         WallpaperInsertAfter(g_wallpaperHost),
         corners[0].x,
         corners[0].y,
@@ -434,7 +458,7 @@ HRESULT StartPlayback(const std::wstring& path) {
         FALSE,
         MFP_OPTION_NONE,
         g_callback,
-        g_window,
+        g_wallpaperWindow,
         &nextPlayer);
     if (SUCCEEDED(result)) {
         result = nextPlayer->CreateMediaItemFromURL(path.c_str(), TRUE, 0, &mediaItem);
@@ -470,6 +494,139 @@ HRESULT StartPlayback(const std::wstring& path) {
         return HRESULT_FROM_WIN32(error);
     }
     return S_OK;
+}
+
+void SetStatus(const wchar_t* status) {
+    if (g_statusLabel != nullptr) {
+        SetWindowTextW(g_statusLabel, status);
+    }
+}
+
+void UpdateControls() {
+    if (g_pathEdit != nullptr) {
+        SetWindowTextW(g_pathEdit, g_selectedPath.c_str());
+    }
+
+    MFP_MEDIAPLAYER_STATE state = MFP_MEDIAPLAYER_STATE_EMPTY;
+    if (g_player != nullptr) {
+        g_player->GetState(&state);
+    }
+
+    if (g_pauseButton != nullptr) {
+        EnableWindow(g_pauseButton, g_player != nullptr);
+        SetWindowTextW(
+            g_pauseButton,
+            state == MFP_MEDIAPLAYER_STATE_PLAYING ? L"一時停止" : L"再生");
+    }
+
+    if (g_player == nullptr) {
+        SetStatus(L"状態: 動画が設定されていない");
+    } else if (state == MFP_MEDIAPLAYER_STATE_PLAYING) {
+        SetStatus(L"状態: 再生中");
+    } else if (state == MFP_MEDIAPLAYER_STATE_PAUSED) {
+        SetStatus(L"状態: 一時停止中");
+    } else {
+        SetStatus(L"状態: 読み込み中");
+    }
+}
+
+void ShowControlWindow() {
+    if (g_controlWindow == nullptr) {
+        return;
+    }
+
+    ShowWindow(g_controlWindow, IsIconic(g_controlWindow) ? SW_RESTORE : SW_SHOW);
+    SetForegroundWindow(g_controlWindow);
+}
+
+void SetSelectedPath(const std::wstring& path) {
+    g_selectedPath = path;
+    if (g_pathEdit != nullptr) {
+        SetWindowTextW(g_pathEdit, path.c_str());
+    }
+}
+
+void ApplySelectedVideo() {
+    if (g_selectedPath.empty()) {
+        ShowError(L"先にH.264 MP4を選択すること。");
+        SetStatus(L"状態: MP4が選択されていない");
+        return;
+    }
+
+    SetStatus(L"状態: 読み込み中...");
+    const HRESULT result = StartPlayback(g_selectedPath);
+    if (result == MF_E_INVALIDMEDIATYPE) {
+        SetStatus(L"状態: H.264 MP4ではない");
+        ShowError(L"H.264映像を含むMP4だけを再生できる。");
+    } else if (FAILED(result)) {
+        SetStatus(L"状態: MP4を開けなかった");
+        ShowError(L"MP4を開けなかった。", result);
+    }
+}
+
+void SelectVideo(bool applyImmediately) {
+    const std::wstring path = PickMp4File(g_controlWindow);
+    if (path.empty()) {
+        return;
+    }
+
+    SetSelectedPath(path);
+    if (applyImmediately) {
+        ApplySelectedVideo();
+    } else {
+        SetStatus(L"状態: 「壁紙に設定」を押すと再生を開始する");
+    }
+}
+
+bool CreateControlChildren(HWND window) {
+    constexpr DWORD labelStyle = WS_CHILD | WS_VISIBLE;
+    constexpr DWORD buttonStyle = WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON;
+
+    HWND pathLabel = CreateWindowExW(
+        0, L"STATIC", L"H.264 MP4ファイル", labelStyle,
+        20, 18, 300, 20, window, nullptr, g_instance, nullptr);
+    g_pathEdit = CreateWindowExW(
+        WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_READONLY,
+        20, 42, 480, 26, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kPathEditId)), g_instance, nullptr);
+    HWND browseButton = CreateWindowExW(
+        0, L"BUTTON", L"参照...", buttonStyle,
+        510, 41, 96, 28, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kBrowseButtonId)), g_instance, nullptr);
+    HWND applyButton = CreateWindowExW(
+        0, L"BUTTON", L"壁紙に設定", buttonStyle,
+        20, 86, 140, 34, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kApplyButtonId)), g_instance, nullptr);
+    g_pauseButton = CreateWindowExW(
+        0, L"BUTTON", L"再生", buttonStyle,
+        170, 86, 110, 34, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kPauseButtonId)), g_instance, nullptr);
+    HWND exitButton = CreateWindowExW(
+        0, L"BUTTON", L"終了", buttonStyle,
+        290, 86, 90, 34, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kExitButtonId)), g_instance, nullptr);
+    g_statusLabel = CreateWindowExW(
+        0, L"STATIC", L"状態: 動画が設定されていない", labelStyle,
+        20, 138, 586, 22, window, nullptr, g_instance, nullptr);
+    HWND hintLabel = CreateWindowExW(
+        0, L"STATIC", L"最小化または×でタスクトレイに格納する。", labelStyle,
+        20, 166, 586, 22, window, nullptr, g_instance, nullptr);
+
+    const HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+    const HWND controls[] = {
+        pathLabel,
+        g_pathEdit,
+        browseButton,
+        applyButton,
+        g_pauseButton,
+        exitButton,
+        g_statusLabel,
+        hintLabel,
+    };
+    for (HWND control : controls) {
+        if (control == nullptr) {
+            return false;
+        }
+        SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+    }
+
+    UpdateControls();
+    return true;
 }
 
 void RestartPlayback() {
@@ -508,24 +665,10 @@ void TogglePlayback() {
     }
 }
 
-void OpenNewVideo() {
-    const std::wstring path = PickMp4File();
-    if (path.empty()) {
-        return;
-    }
-
-    const HRESULT result = StartPlayback(path);
-    if (result == MF_E_INVALIDMEDIATYPE) {
-        ShowError(L"H.264映像を含むMP4だけを再生できる。");
-    } else if (FAILED(result)) {
-        ShowError(L"MP4を開けなかった。", result);
-    }
-}
-
 void AddTrayIcon() {
     g_trayIcon = {};
     g_trayIcon.cbSize = sizeof(g_trayIcon);
-    g_trayIcon.hWnd = g_window;
+    g_trayIcon.hWnd = g_controlWindow;
     g_trayIcon.uID = 1;
     g_trayIcon.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
     g_trayIcon.uCallbackMessage = kTrayMessage;
@@ -555,46 +698,45 @@ void ShowTrayMenu() {
     }
     const wchar_t* pauseLabel = state == MFP_MEDIAPLAYER_STATE_PLAYING ? L"一時停止" : L"再生";
 
-    AppendMenuW(menu, MF_STRING, kOpenCommand, L"MP4を開く...");
+    AppendMenuW(menu, MF_STRING | MF_DEFAULT, kShowCommand, L"設定を開く");
+    AppendMenuW(menu, MF_STRING, kOpenCommand, L"MP4を選択...");
     AppendMenuW(menu, MF_STRING | (g_player == nullptr ? MF_GRAYED : 0), kPauseCommand, pauseLabel);
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kExitCommand, L"終了");
 
     POINT cursor{};
     GetCursorPos(&cursor);
-    SetForegroundWindow(g_window);
+    SetForegroundWindow(g_controlWindow);
     const UINT command = TrackPopupMenu(
         menu,
         TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
         cursor.x,
         cursor.y,
         0,
-        g_window,
+        g_controlWindow,
         nullptr);
     DestroyMenu(menu);
 
     switch (command) {
+    case kShowCommand:
+        ShowControlWindow();
+        break;
     case kOpenCommand:
-        OpenNewVideo();
+        SelectVideo(true);
         break;
     case kPauseCommand:
         TogglePlayback();
         break;
     case kExitCommand:
-        DestroyWindow(g_window);
+        g_isExiting = true;
+        DestroyWindow(g_controlWindow);
         break;
     default:
         break;
     }
 }
 
-LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
-    if (message == g_taskbarCreatedMessage && g_taskbarCreatedMessage != 0) {
-        AddTrayIcon();
-        AttachToDesktop();
-        return 0;
-    }
-
+LRESULT CALLBACK WallpaperWindowProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case WM_PAINT: {
         PAINTSTRUCT paint{};
@@ -610,16 +752,62 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
             g_player->UpdateVideo();
         }
         return 0;
-    case WM_DISPLAYCHANGE:
-        ResizeForPrimaryMonitor();
-        return 0;
     case WM_ERASEBKGND:
         return 1;
+    default:
+        return DefWindowProcW(window, message, wParam, lParam);
+    }
+}
+
+LRESULT CALLBACK ControlWindowProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    if (message == g_taskbarCreatedMessage && g_taskbarCreatedMessage != 0) {
+        AddTrayIcon();
+        if (g_player != nullptr) {
+            AttachToDesktop();
+        }
+        return 0;
+    }
+
+    switch (message) {
+    case WM_CREATE:
+        if (!CreateControlChildren(window)) {
+            return -1;
+        }
+        return 0;
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case kBrowseButtonId:
+            SelectVideo(false);
+            break;
+        case kApplyButtonId:
+            ApplySelectedVideo();
+            break;
+        case kPauseButtonId:
+            TogglePlayback();
+            break;
+        case kExitButtonId:
+            g_isExiting = true;
+            DestroyWindow(window);
+            break;
+        default:
+            break;
+        }
+        return 0;
+    case WM_SIZE:
+        if (wParam == SIZE_MINIMIZED) {
+            ShowWindow(window, SW_HIDE);
+        }
+        return 0;
+    case WM_DISPLAYCHANGE:
+        if (g_player != nullptr) {
+            ResizeForPrimaryMonitor();
+        }
+        return 0;
     case kTrayMessage:
         if (LOWORD(lParam) == WM_CONTEXTMENU || LOWORD(lParam) == WM_RBUTTONUP) {
             ShowTrayMenu();
         } else if (LOWORD(lParam) == WM_LBUTTONDBLCLK) {
-            TogglePlayback();
+            ShowControlWindow();
         }
         return 0;
     case kPlaybackEndedMessage:
@@ -632,6 +820,7 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
             g_restartPending = false;
             const HRESULT result = g_player->Play();
             if (FAILED(result)) {
+                SetStatus(L"状態: ループ再生を再開できなかった");
                 ShowError(L"ループ再生を再開できなかった。", result);
             }
         }
@@ -649,19 +838,31 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
                 result = g_player->Play();
             }
             if (FAILED(result)) {
+                SetStatus(L"状態: 動画の再生を開始できなかった");
                 ShowError(L"動画の再生を開始できなかった。", result);
             } else {
                 SaveCurrentPath(g_currentPath);
+                UpdateControls();
             }
+        }
+        return 0;
+    case kPlaybackStateMessage:
+        if (reinterpret_cast<IMFPMediaPlayer*>(wParam) == g_player) {
+            UpdateControls();
         }
         return 0;
     case kPlaybackErrorMessage:
         if (reinterpret_cast<IMFPMediaPlayer*>(wParam) == g_player) {
+            SetStatus(L"状態: 再生エラー");
             ShowError(L"再生中にMedia Foundationエラーが発生した。", static_cast<HRESULT>(lParam));
         }
         return 0;
     case WM_CLOSE:
-        DestroyWindow(window);
+        if (g_isExiting) {
+            DestroyWindow(window);
+        } else {
+            ShowWindow(window, SW_HIDE);
+        }
         return 0;
     case WM_DESTROY:
         RemoveTrayIcon();
@@ -670,6 +871,10 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
             g_callback->ClearWindow();
         }
         ShutdownPlayer(g_player);
+        if (g_wallpaperWindow != nullptr) {
+            DestroyWindow(g_wallpaperWindow);
+            g_wallpaperWindow = nullptr;
+        }
         PostQuitMessage(0);
         return 0;
     default:
@@ -694,7 +899,7 @@ std::wstring CommandLineVideoPath() {
 
 } // namespace
 
-int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int) {
+int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int showCommand) {
     g_instance = instance;
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
@@ -711,24 +916,33 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int) {
         return 1;
     }
 
-    WNDCLASSEXW windowClass{};
-    windowClass.cbSize = sizeof(windowClass);
-    windowClass.lpfnWndProc = WindowProcedure;
-    windowClass.hInstance = instance;
-    windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    windowClass.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
-    windowClass.lpszClassName = kWindowClassName;
+    WNDCLASSEXW wallpaperClass{};
+    wallpaperClass.cbSize = sizeof(wallpaperClass);
+    wallpaperClass.lpfnWndProc = WallpaperWindowProcedure;
+    wallpaperClass.hInstance = instance;
+    wallpaperClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wallpaperClass.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+    wallpaperClass.lpszClassName = kWallpaperWindowClassName;
 
-    if (RegisterClassExW(&windowClass) == 0) {
+    WNDCLASSEXW controlClass{};
+    controlClass.cbSize = sizeof(controlClass);
+    controlClass.lpfnWndProc = ControlWindowProcedure;
+    controlClass.hInstance = instance;
+    controlClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    controlClass.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    controlClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    controlClass.lpszClassName = kControlWindowClassName;
+
+    if (RegisterClassExW(&wallpaperClass) == 0 || RegisterClassExW(&controlClass) == 0) {
         ShowError(L"ウィンドウクラスを登録できなかった。", HRESULT_FROM_WIN32(GetLastError()));
         MFShutdown();
         CoUninitialize();
         return 1;
     }
 
-    g_window = CreateWindowExW(
+    g_wallpaperWindow = CreateWindowExW(
         WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
-        kWindowClassName,
+        kWallpaperWindowClassName,
         kApplicationName,
         WS_POPUP,
         0,
@@ -739,33 +953,55 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int) {
         nullptr,
         instance,
         nullptr);
-    if (g_window == nullptr) {
+    if (g_wallpaperWindow == nullptr) {
         ShowError(L"壁紙ウィンドウを作成できなかった。", HRESULT_FROM_WIN32(GetLastError()));
         MFShutdown();
         CoUninitialize();
         return 1;
     }
 
-    g_callback = new MediaPlayerCallback(g_window);
+    constexpr DWORD controlStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+    RECT controlRectangle{0, 0, 630, 205};
+    AdjustWindowRectEx(&controlRectangle, controlStyle, FALSE, 0);
+    g_controlWindow = CreateWindowExW(
+        0,
+        kControlWindowClassName,
+        kApplicationName,
+        controlStyle,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        controlRectangle.right - controlRectangle.left,
+        controlRectangle.bottom - controlRectangle.top,
+        nullptr,
+        nullptr,
+        instance,
+        nullptr);
+    if (g_controlWindow == nullptr) {
+        ShowError(L"設定ウィンドウを作成できなかった。", HRESULT_FROM_WIN32(GetLastError()));
+        DestroyWindow(g_wallpaperWindow);
+        g_wallpaperWindow = nullptr;
+        MFShutdown();
+        CoUninitialize();
+        return 1;
+    }
+
+    g_callback = new MediaPlayerCallback(g_controlWindow);
     g_taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
     AddTrayIcon();
+
+    ShowWindow(g_controlWindow, showCommand == SW_HIDE ? SW_SHOWNORMAL : showCommand);
+    UpdateWindow(g_controlWindow);
 
     std::wstring initialPath = CommandLineVideoPath();
     if (initialPath.empty()) {
         initialPath = LoadCurrentPath();
     }
-    if (!IsExistingFile(initialPath)) {
-        initialPath = PickMp4File();
-    }
-
-    if (initialPath.empty()) {
-        DestroyWindow(g_window);
-    } else {
-        result = StartPlayback(initialPath);
-        if (result == MF_E_INVALIDMEDIATYPE) {
-            ShowError(L"H.264映像を含むMP4だけを再生できる。");
-        } else if (FAILED(result)) {
-            ShowError(L"MP4を開けなかった。", result);
+    if (!initialPath.empty()) {
+        SetSelectedPath(initialPath);
+        if (IsExistingFile(initialPath)) {
+            ApplySelectedVideo();
+        } else {
+            SetStatus(L"状態: 前回のMP4が見つからない");
         }
     }
 
