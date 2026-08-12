@@ -20,6 +20,8 @@ namespace {
 constexpr wchar_t kControlWindowClassName[] = L"WallpaperMp4ControlWindow";
 constexpr wchar_t kWallpaperWindowClassName[] = L"WallpaperMp4Window";
 constexpr wchar_t kApplicationName[] = L"wallpaper-mp4";
+constexpr wchar_t kRunKeyPath[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+constexpr wchar_t kStartupArgument[] = L"--startup";
 
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kPlaybackEndedMessage = WM_APP + 2;
@@ -40,6 +42,7 @@ constexpr int kApplyButtonId = 2003;
 constexpr int kPauseButtonId = 2004;
 constexpr int kExitButtonId = 2005;
 constexpr int kAudioCheckId = 2006;
+constexpr int kStartupCheckId = 2007;
 
 constexpr UINT kExplorerSpawnWorkerMessage = 0x052C;
 
@@ -51,6 +54,7 @@ HWND g_pathEdit = nullptr;
 HWND g_statusLabel = nullptr;
 HWND g_pauseButton = nullptr;
 HWND g_audioCheck = nullptr;
+HWND g_startupCheck = nullptr;
 IMFPMediaPlayer* g_player = nullptr;
 NOTIFYICONDATAW g_trayIcon{};
 UINT g_taskbarCreatedMessage = 0;
@@ -262,6 +266,75 @@ std::wstring LoadCurrentPath() {
         static_cast<DWORD>(value.size()),
         settings.c_str());
     return value.data();
+}
+
+std::wstring ExecutablePath() {
+    std::vector<wchar_t> path(32768);
+    const DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+    if (length == 0 || length == path.size()) {
+        return {};
+    }
+    return std::wstring(path.data(), length);
+}
+
+std::wstring StartupCommand() {
+    const std::wstring executable = ExecutablePath();
+    if (executable.empty()) {
+        return {};
+    }
+    return L"\"" + executable + L"\" " + kStartupArgument;
+}
+
+bool IsStartupEnabled() {
+    DWORD size = 0;
+    return RegGetValueW(
+        HKEY_CURRENT_USER,
+        kRunKeyPath,
+        kApplicationName,
+        RRF_RT_REG_SZ,
+        nullptr,
+        nullptr,
+        &size) == ERROR_SUCCESS;
+}
+
+HRESULT SetStartupEnabled(bool enabled) {
+    HKEY runKey = nullptr;
+    LSTATUS status = RegCreateKeyExW(
+        HKEY_CURRENT_USER,
+        kRunKeyPath,
+        0,
+        nullptr,
+        REG_OPTION_NON_VOLATILE,
+        KEY_SET_VALUE,
+        nullptr,
+        &runKey,
+        nullptr);
+    if (status != ERROR_SUCCESS) {
+        return HRESULT_FROM_WIN32(status);
+    }
+
+    if (enabled) {
+        const std::wstring command = StartupCommand();
+        if (command.empty()) {
+            RegCloseKey(runKey);
+            return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+        }
+        status = RegSetValueExW(
+            runKey,
+            kApplicationName,
+            0,
+            REG_SZ,
+            reinterpret_cast<const BYTE*>(command.c_str()),
+            static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
+    } else {
+        status = RegDeleteValueW(runKey, kApplicationName);
+        if (status == ERROR_FILE_NOT_FOUND) {
+            status = ERROR_SUCCESS;
+        }
+    }
+
+    RegCloseKey(runKey);
+    return status == ERROR_SUCCESS ? S_OK : HRESULT_FROM_WIN32(status);
 }
 
 bool LoadAudioEnabled() {
@@ -540,6 +613,10 @@ void UpdateControls() {
         SendMessageW(g_audioCheck, BM_SETCHECK, g_audioEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
     }
 
+    if (g_startupCheck != nullptr) {
+        SendMessageW(g_startupCheck, BM_SETCHECK, IsStartupEnabled() ? BST_CHECKED : BST_UNCHECKED, 0);
+    }
+
     if (g_player == nullptr) {
         SetStatus(L"状態: 動画が設定されていない");
     } else if (state == MFP_MEDIAPLAYER_STATE_PLAYING) {
@@ -624,12 +701,15 @@ bool CreateControlChildren(HWND window) {
     g_audioCheck = CreateWindowExW(
         0, L"BUTTON", L"音声を再生", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
         400, 91, 150, 24, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kAudioCheckId)), g_instance, nullptr);
+    g_startupCheck = CreateWindowExW(
+        0, L"BUTTON", L"Windowsログイン時に起動", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+        20, 132, 220, 24, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kStartupCheckId)), g_instance, nullptr);
     g_statusLabel = CreateWindowExW(
         0, L"STATIC", L"状態: 動画が設定されていない", labelStyle,
-        20, 138, 586, 22, window, nullptr, g_instance, nullptr);
+        20, 164, 586, 22, window, nullptr, g_instance, nullptr);
     HWND hintLabel = CreateWindowExW(
         0, L"STATIC", L"最小化または×でタスクトレイに格納する。", labelStyle,
-        20, 166, 586, 22, window, nullptr, g_instance, nullptr);
+        20, 192, 586, 22, window, nullptr, g_instance, nullptr);
 
     const HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
     const HWND controls[] = {
@@ -640,6 +720,7 @@ bool CreateControlChildren(HWND window) {
         g_pauseButton,
         exitButton,
         g_audioCheck,
+        g_startupCheck,
         g_statusLabel,
         hintLabel,
     };
@@ -703,6 +784,15 @@ void ToggleAudio() {
 
     g_audioEnabled = nextAudioEnabled;
     SaveAudioEnabled(g_audioEnabled);
+    UpdateControls();
+}
+
+void ToggleStartup() {
+    const bool nextStartupEnabled = !IsStartupEnabled();
+    const HRESULT result = SetStartupEnabled(nextStartupEnabled);
+    if (FAILED(result)) {
+        ShowError(L"自動起動設定を変更できなかった。", result);
+    }
     UpdateControls();
 }
 
@@ -833,6 +923,9 @@ LRESULT CALLBACK ControlWindowProcedure(HWND window, UINT message, WPARAM wParam
         case kAudioCheckId:
             ToggleAudio();
             break;
+        case kStartupCheckId:
+            ToggleStartup();
+            break;
         case kExitButtonId:
             g_isExiting = true;
             DestroyWindow(window);
@@ -930,25 +1023,35 @@ LRESULT CALLBACK ControlWindowProcedure(HWND window, UINT message, WPARAM wParam
     }
 }
 
-std::wstring CommandLineVideoPath() {
+struct CommandLineOptions {
+    bool startup = false;
+    std::wstring videoPath;
+};
+
+CommandLineOptions ParseCommandLine() {
     int argumentCount = 0;
     wchar_t** arguments = CommandLineToArgvW(GetCommandLineW(), &argumentCount);
     if (arguments == nullptr) {
         return {};
     }
 
-    std::wstring path;
-    if (argumentCount >= 2) {
-        path = arguments[1];
+    CommandLineOptions options;
+    for (int index = 1; index < argumentCount; ++index) {
+        if (wcscmp(arguments[index], kStartupArgument) == 0) {
+            options.startup = true;
+        } else if (options.videoPath.empty()) {
+            options.videoPath = arguments[index];
+        }
     }
     LocalFree(arguments);
-    return path;
+    return options;
 }
 
 } // namespace
 
 int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int showCommand) {
     g_instance = instance;
+    const CommandLineOptions commandLine = ParseCommandLine();
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     HRESULT result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -1011,7 +1114,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int showCommand) 
     }
 
     constexpr DWORD controlStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    RECT controlRectangle{0, 0, 630, 205};
+    RECT controlRectangle{0, 0, 630, 233};
     AdjustWindowRectEx(&controlRectangle, controlStyle, FALSE, 0);
     g_controlWindow = CreateWindowExW(
         0,
@@ -1039,10 +1142,12 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int showCommand) 
     g_taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
     AddTrayIcon();
 
-    ShowWindow(g_controlWindow, showCommand == SW_HIDE ? SW_SHOWNORMAL : showCommand);
-    UpdateWindow(g_controlWindow);
+    if (!commandLine.startup) {
+        ShowWindow(g_controlWindow, showCommand == SW_HIDE ? SW_SHOWNORMAL : showCommand);
+        UpdateWindow(g_controlWindow);
+    }
 
-    std::wstring initialPath = CommandLineVideoPath();
+    std::wstring initialPath = commandLine.videoPath;
     if (initialPath.empty()) {
         initialPath = LoadCurrentPath();
     }

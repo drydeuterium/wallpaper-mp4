@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(wallpaper_mp4 VERSION 0.2.0 LANGUAGES CXX)
+project(wallpaper_mp4 VERSION 0.3.0 LANGUAGES CXX)
 
 add_executable(wallpaper-mp4 WIN32
     src/main.cpp
@@ -23,6 +23,7 @@ if(MSVC)
 endif()
 
 target_link_libraries(wallpaper-mp4 PRIVATE
+    advapi32
     comdlg32
     gdi32
     mf
