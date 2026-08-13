@@ -1,0 +1,33 @@
+#include <windows.h>
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 0,3,0,1
+ PRODUCTVERSION 0,3,0,1
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+ FILEFLAGS VS_FF_DEBUG
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "drydeuterium\0"
+            VALUE "FileDescription", "wallpaper-mp4 Laptop Edition\0"
+            VALUE "FileVersion", "@WALLPAPER_MP4_EDITION_VERSION@\0"
+            VALUE "InternalName", "wallpaper-mp4-laptop\0"
+            VALUE "OriginalFilename", "wallpaper-mp4-laptop.exe\0"
+            VALUE "ProductName", "wallpaper-mp4 Laptop Edition\0"
+            VALUE "ProductVersion", "@WALLPAPER_MP4_EDITION_VERSION@\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

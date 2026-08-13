@@ -19,9 +19,14 @@ namespace {
 
 constexpr wchar_t kControlWindowClassName[] = L"WallpaperMp4ControlWindow";
 constexpr wchar_t kWallpaperWindowClassName[] = L"WallpaperMp4Window";
-constexpr wchar_t kApplicationName[] = L"wallpaper-mp4";
+constexpr wchar_t kApplicationName[] = L"wallpaper-mp4 Laptop Edition";
+constexpr wchar_t kSettingsDirectoryName[] = L"wallpaper-mp4-laptop";
+constexpr wchar_t kStartupValueName[] = L"wallpaper-mp4-laptop";
 constexpr wchar_t kRunKeyPath[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr wchar_t kStartupArgument[] = L"--startup";
+constexpr wchar_t kGpuPreferencesKeyPath[] = L"Software\\Microsoft\\DirectX\\UserGpuPreferences";
+constexpr wchar_t kGpuPreferenceReadyArgument[] = L"--gpu-preference-ready";
+constexpr wchar_t kMinimumPowerGpuPreference[] = L"GpuPreference=1;";
 
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kPlaybackEndedMessage = WM_APP + 2;
@@ -50,6 +55,8 @@ HINSTANCE g_instance = nullptr;
 HWND g_controlWindow = nullptr;
 HWND g_wallpaperWindow = nullptr;
 HWND g_wallpaperHost = nullptr;
+HWND g_desktopIconView = nullptr;
+HWND g_systemWallpaperWindow = nullptr;
 HWND g_pathEdit = nullptr;
 HWND g_statusLabel = nullptr;
 HWND g_pauseButton = nullptr;
@@ -61,6 +68,8 @@ UINT g_taskbarCreatedMessage = 0;
 bool g_restartPending = false;
 bool g_isExiting = false;
 bool g_audioEnabled = false;
+bool g_videoReady = false;
+bool g_raisedDesktop = false;
 std::wstring g_currentPath;
 std::wstring g_selectedPath;
 
@@ -222,7 +231,7 @@ std::filesystem::path SettingsPath() {
         return {};
     }
 
-    std::filesystem::path directory = std::filesystem::path(localAppData) / kApplicationName;
+    std::filesystem::path directory = std::filesystem::path(localAppData) / kSettingsDirectoryName;
     CoTaskMemFree(localAppData);
 
     std::error_code error;
@@ -277,6 +286,135 @@ std::wstring ExecutablePath() {
     return std::wstring(path.data(), length);
 }
 
+HRESULT EnsureMinimumPowerGpuPreference(bool& changed) {
+    changed = false;
+
+    const std::wstring executable = ExecutablePath();
+    if (executable.empty()) {
+        return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+    }
+
+    HKEY preferencesKey = nullptr;
+    LSTATUS status = RegCreateKeyExW(
+        HKEY_CURRENT_USER,
+        kGpuPreferencesKeyPath,
+        0,
+        nullptr,
+        REG_OPTION_NON_VOLATILE,
+        KEY_QUERY_VALUE | KEY_SET_VALUE,
+        nullptr,
+        &preferencesKey,
+        nullptr);
+    if (status != ERROR_SUCCESS) {
+        return HRESULT_FROM_WIN32(status);
+    }
+
+    DWORD type = 0;
+    DWORD byteCount = 0;
+    status = RegQueryValueExW(
+        preferencesKey,
+        executable.c_str(),
+        nullptr,
+        &type,
+        nullptr,
+        &byteCount);
+
+    std::wstring preference;
+    bool hasExistingPreference = false;
+    if (status == ERROR_SUCCESS && type == REG_SZ && byteCount >= sizeof(wchar_t)) {
+        // Keep one zero-initialized character past the registry payload so a
+        // malformed REG_SZ without a terminator cannot escape the buffer.
+        std::vector<wchar_t> value(byteCount / sizeof(wchar_t) + 1);
+        status = RegQueryValueExW(
+            preferencesKey,
+            executable.c_str(),
+            nullptr,
+            &type,
+            reinterpret_cast<BYTE*>(value.data()),
+            &byteCount);
+        if (status == ERROR_SUCCESS) {
+            preference = value.data();
+            hasExistingPreference = true;
+        }
+    } else if (status == ERROR_FILE_NOT_FOUND) {
+        status = ERROR_SUCCESS;
+    }
+
+    if (status != ERROR_SUCCESS) {
+        RegCloseKey(preferencesKey);
+        return HRESULT_FROM_WIN32(status);
+    }
+
+    const std::wstring existingPreference = preference;
+    constexpr wchar_t gpuPreferencePrefix[] = L"GpuPreference=";
+    const size_t gpuPreferenceStart = preference.find(gpuPreferencePrefix);
+    if (gpuPreferenceStart != std::wstring::npos) {
+        size_t gpuPreferenceEnd = preference.find(L';', gpuPreferenceStart);
+        if (gpuPreferenceEnd == std::wstring::npos) {
+            gpuPreferenceEnd = preference.size();
+        } else {
+            ++gpuPreferenceEnd;
+        }
+        preference.replace(
+            gpuPreferenceStart,
+            gpuPreferenceEnd - gpuPreferenceStart,
+            kMinimumPowerGpuPreference);
+    } else {
+        preference += kMinimumPowerGpuPreference;
+    }
+
+    if (hasExistingPreference && preference == existingPreference) {
+        RegCloseKey(preferencesKey);
+        return S_OK;
+    }
+
+    status = RegSetValueExW(
+        preferencesKey,
+        executable.c_str(),
+        0,
+        REG_SZ,
+        reinterpret_cast<const BYTE*>(preference.c_str()),
+        static_cast<DWORD>((preference.size() + 1) * sizeof(wchar_t)));
+    RegCloseKey(preferencesKey);
+
+    if (status != ERROR_SUCCESS) {
+        return HRESULT_FROM_WIN32(status);
+    }
+
+    changed = true;
+    return S_OK;
+}
+
+HRESULT RelaunchForGpuPreference() {
+    std::wstring commandLine = GetCommandLineW();
+    commandLine += L" ";
+    commandLine += kGpuPreferenceReadyArgument;
+
+    std::vector<wchar_t> mutableCommandLine(commandLine.begin(), commandLine.end());
+    mutableCommandLine.push_back(L'\0');
+
+    STARTUPINFOW startupInformation{};
+    startupInformation.cb = sizeof(startupInformation);
+    PROCESS_INFORMATION processInformation{};
+    if (!CreateProcessW(
+            nullptr,
+            mutableCommandLine.data(),
+            nullptr,
+            nullptr,
+            FALSE,
+            0,
+            nullptr,
+            nullptr,
+            &startupInformation,
+            &processInformation)) {
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
+
+    CloseHandle(processInformation.hThread);
+    CloseHandle(processInformation.hProcess);
+    return S_OK;
+}
+
 std::wstring StartupCommand() {
     const std::wstring executable = ExecutablePath();
     if (executable.empty()) {
@@ -290,7 +428,7 @@ bool IsStartupEnabled() {
     return RegGetValueW(
         HKEY_CURRENT_USER,
         kRunKeyPath,
-        kApplicationName,
+        kStartupValueName,
         RRF_RT_REG_SZ,
         nullptr,
         nullptr,
@@ -321,13 +459,13 @@ HRESULT SetStartupEnabled(bool enabled) {
         }
         status = RegSetValueExW(
             runKey,
-            kApplicationName,
+            kStartupValueName,
             0,
             REG_SZ,
             reinterpret_cast<const BYTE*>(command.c_str()),
             static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
     } else {
-        status = RegDeleteValueW(runKey, kApplicationName);
+        status = RegDeleteValueW(runKey, kStartupValueName);
         if (status == ERROR_FILE_NOT_FOUND) {
             status = ERROR_SUCCESS;
         }
@@ -377,14 +515,33 @@ std::wstring PickMp4File(HWND owner) {
     return fileName.data();
 }
 
-BOOL CALLBACK FindWallpaperWorker(HWND topLevelWindow, LPARAM parameter) {
-    if (FindWindowExW(topLevelWindow, nullptr, L"SHELLDLL_DefView", nullptr) == nullptr) {
+struct DesktopHostSearch {
+    HWND iconHost = nullptr;
+    HWND wallpaperWorker = nullptr;
+};
+
+BOOL CALLBACK FindDesktopHost(HWND topLevelWindow, LPARAM parameter) {
+    HWND iconView = FindWindowExW(topLevelWindow, nullptr, L"SHELLDLL_DefView", nullptr);
+    if (iconView == nullptr) {
         return TRUE;
     }
 
-    auto* result = reinterpret_cast<HWND*>(parameter);
-    *result = FindWindowExW(nullptr, topLevelWindow, L"WorkerW", nullptr);
-    return *result == nullptr;
+    auto* result = reinterpret_cast<DesktopHostSearch*>(parameter);
+    result->iconHost = topLevelWindow;
+    g_desktopIconView = iconView;
+
+    DWORD explorerProcessId = 0;
+    GetWindowThreadProcessId(topLevelWindow, &explorerProcessId);
+    HWND candidate = topLevelWindow;
+    while ((candidate = FindWindowExW(nullptr, candidate, L"WorkerW", nullptr)) != nullptr) {
+        DWORD candidateProcessId = 0;
+        GetWindowThreadProcessId(candidate, &candidateProcessId);
+        if (candidateProcessId == explorerProcessId) {
+            result->wallpaperWorker = candidate;
+            break;
+        }
+    }
+    return FALSE;
 }
 
 HWND FindWallpaperHost() {
@@ -396,19 +553,37 @@ HWND FindWallpaperHost() {
         return nullptr;
     }
 
+    g_raisedDesktop =
+        (GetWindowLongPtrW(programManager, GWL_EXSTYLE) & WS_EX_NOREDIRECTIONBITMAP) != 0;
+
     DWORD_PTR ignored = 0;
     SendMessageTimeoutW(
         programManager,
         kExplorerSpawnWorkerMessage,
-        0,
-        0,
+        0x0D,
+        0x01,
         SMTO_NORMAL,
         1000,
         &ignored);
 
-    HWND worker = nullptr;
-    EnumWindows(FindWallpaperWorker, reinterpret_cast<LPARAM>(&worker));
-    return worker != nullptr ? worker : programManager;
+    if (g_raisedDesktop) {
+        // Current Windows 11 keeps the icon view and wallpaper WorkerW as
+        // children of Progman instead of separate top-level WorkerW windows.
+        g_desktopIconView = FindWindowExW(programManager, nullptr, L"SHELLDLL_DefView", nullptr);
+        g_systemWallpaperWindow = FindWindowExW(programManager, nullptr, L"WorkerW", nullptr);
+        return g_desktopIconView != nullptr && g_systemWallpaperWindow != nullptr
+            ? programManager
+            : nullptr;
+    }
+
+    DesktopHostSearch search{};
+    EnumWindows(FindDesktopHost, reinterpret_cast<LPARAM>(&search));
+    g_systemWallpaperWindow = search.wallpaperWorker;
+
+    // WorkerW is not an Explorer-private class.  Only use the next WorkerW if
+    // it belongs to the same process as the desktop icon host; otherwise an
+    // unrelated app's invisible WorkerW can swallow the render window.
+    return search.wallpaperWorker != nullptr ? search.wallpaperWorker : search.iconHost;
 }
 
 RECT PrimaryMonitorRectangle() {
@@ -423,7 +598,9 @@ RECT PrimaryMonitorRectangle() {
 }
 
 HWND WallpaperInsertAfter(HWND host) {
-    const HWND iconView = FindWindowExW(host, nullptr, L"SHELLDLL_DefView", nullptr);
+    const HWND iconView = g_desktopIconView != nullptr && GetParent(g_desktopIconView) == host
+        ? g_desktopIconView
+        : FindWindowExW(host, nullptr, L"SHELLDLL_DefView", nullptr);
     return iconView != nullptr ? iconView : HWND_TOP;
 }
 
@@ -437,6 +614,18 @@ bool AttachToDesktop() {
     style &= ~static_cast<LONG_PTR>(WS_POPUP);
     style |= WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
     SetWindowLongPtrW(g_wallpaperWindow, GWL_STYLE, style);
+
+    LONG_PTR extendedStyle = GetWindowLongPtrW(g_wallpaperWindow, GWL_EXSTYLE);
+    if (g_raisedDesktop) {
+        extendedStyle |= WS_EX_LAYERED;
+    } else {
+        extendedStyle &= ~static_cast<LONG_PTR>(WS_EX_LAYERED);
+    }
+    SetWindowLongPtrW(g_wallpaperWindow, GWL_EXSTYLE, extendedStyle);
+    if (g_raisedDesktop &&
+        !SetLayeredWindowAttributes(g_wallpaperWindow, 0, 255, LWA_ALPHA)) {
+        return false;
+    }
 
     SetLastError(ERROR_SUCCESS);
     const HWND previousParent = SetParent(g_wallpaperWindow, host);
@@ -452,14 +641,27 @@ bool AttachToDesktop() {
     MapWindowPoints(HWND_DESKTOP, host, corners, 2);
 
     g_wallpaperHost = host;
-    SetWindowPos(
+    if (!SetWindowPos(
         g_wallpaperWindow,
         WallpaperInsertAfter(host),
         corners[0].x,
         corners[0].y,
         corners[1].x - corners[0].x,
         corners[1].y - corners[0].y,
-        SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
+        return false;
+    }
+
+    if (g_raisedDesktop && g_systemWallpaperWindow != nullptr) {
+        SetWindowPos(
+            g_systemWallpaperWindow,
+            HWND_BOTTOM,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
     return true;
 }
 
@@ -540,6 +742,15 @@ HRESULT StartPlayback(const std::wstring& path) {
         return MF_E_INVALIDMEDIATYPE;
     }
 
+    // MFPlay creates its Direct3D renderer for the window passed to
+    // MFPCreateMediaPlayer.  Give it the final parent and dimensions up front;
+    // reparenting and resizing while SetMediaItem is still completing can race
+    // the renderer initialization on hybrid-GPU systems.
+    if (!AttachToDesktop()) {
+        const DWORD error = GetLastError() == ERROR_SUCCESS ? ERROR_INVALID_WINDOW_HANDLE : GetLastError();
+        return HRESULT_FROM_WIN32(error);
+    }
+
     IMFPMediaPlayer* nextPlayer = nullptr;
     IMFPMediaItem* mediaItem = nullptr;
 
@@ -557,7 +768,10 @@ HRESULT StartPlayback(const std::wstring& path) {
         result = InspectMediaItem(mediaItem);
     }
     IMFPMediaPlayer* previousPlayer = g_player;
+    const bool previousVideoReady = g_videoReady;
     if (SUCCEEDED(result)) {
+        g_videoReady = false;
+        g_restartPending = false;
         g_callback->SetActivePlayer(nextPlayer);
         g_player = nextPlayer;
         result = nextPlayer->SetMediaItem(mediaItem);
@@ -567,6 +781,7 @@ HRESULT StartPlayback(const std::wstring& path) {
     if (FAILED(result)) {
         if (g_player == nextPlayer) {
             g_player = previousPlayer;
+            g_videoReady = previousVideoReady;
             g_callback->SetActivePlayer(previousPlayer);
         }
         ShutdownPlayer(nextPlayer);
@@ -575,14 +790,7 @@ HRESULT StartPlayback(const std::wstring& path) {
 
     ShutdownPlayer(previousPlayer);
     g_currentPath = path;
-    g_restartPending = false;
-
-    if (!AttachToDesktop()) {
-        const DWORD error = GetLastError() == ERROR_SUCCESS ? ERROR_INVALID_WINDOW_HANDLE : GetLastError();
-        g_callback->SetActivePlayer(nullptr);
-        ShutdownPlayer(g_player);
-        return HRESULT_FROM_WIN32(error);
-    }
+    InvalidateRect(g_wallpaperWindow, nullptr, FALSE);
     return S_OK;
 }
 
@@ -876,14 +1084,16 @@ LRESULT CALLBACK WallpaperWindowProcedure(HWND window, UINT message, WPARAM wPar
     case WM_PAINT: {
         PAINTSTRUCT paint{};
         BeginPaint(window, &paint);
-        if (g_player != nullptr) {
+        if (g_player != nullptr && g_videoReady) {
             g_player->UpdateVideo();
+        } else {
+            FillRect(paint.hdc, &paint.rcPaint, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
         }
         EndPaint(window, &paint);
         return 0;
     }
     case WM_SIZE:
-        if (g_player != nullptr) {
+        if (g_player != nullptr && g_videoReady) {
             g_player->UpdateVideo();
         }
         return 0;
@@ -976,9 +1186,15 @@ LRESULT CALLBACK ControlWindowProcedure(HWND window, UINT message, WPARAM wParam
                 result = g_player->SetBorderColor(RGB(0, 0, 0));
             }
             if (SUCCEEDED(result)) {
+                // SetMediaItem has completed, so UpdateVideo may now touch the
+                // renderer.  Keep this false on every earlier code path.
+                g_videoReady = true;
                 result = g_player->Play();
+                InvalidateRect(g_wallpaperWindow, nullptr, FALSE);
             }
             if (FAILED(result)) {
+                g_videoReady = false;
+                InvalidateRect(g_wallpaperWindow, nullptr, FALSE);
                 SetStatus(L"状態: 動画の再生を開始できなかった");
                 ShowError(L"動画の再生を開始できなかった。", result);
             } else {
@@ -994,6 +1210,8 @@ LRESULT CALLBACK ControlWindowProcedure(HWND window, UINT message, WPARAM wParam
         return 0;
     case kPlaybackErrorMessage:
         if (reinterpret_cast<IMFPMediaPlayer*>(wParam) == g_player) {
+            g_videoReady = false;
+            InvalidateRect(g_wallpaperWindow, nullptr, FALSE);
             SetStatus(L"状態: 再生エラー");
             ShowError(L"再生中にMedia Foundationエラーが発生した。", static_cast<HRESULT>(lParam));
         }
@@ -1007,6 +1225,7 @@ LRESULT CALLBACK ControlWindowProcedure(HWND window, UINT message, WPARAM wParam
         return 0;
     case WM_DESTROY:
         RemoveTrayIcon();
+        g_videoReady = false;
         if (g_callback != nullptr) {
             g_callback->SetActivePlayer(nullptr);
             g_callback->ClearWindow();
@@ -1025,6 +1244,7 @@ LRESULT CALLBACK ControlWindowProcedure(HWND window, UINT message, WPARAM wParam
 
 struct CommandLineOptions {
     bool startup = false;
+    bool gpuPreferenceReady = false;
     std::wstring videoPath;
 };
 
@@ -1039,6 +1259,8 @@ CommandLineOptions ParseCommandLine() {
     for (int index = 1; index < argumentCount; ++index) {
         if (wcscmp(arguments[index], kStartupArgument) == 0) {
             options.startup = true;
+        } else if (wcscmp(arguments[index], kGpuPreferenceReadyArgument) == 0) {
+            options.gpuPreferenceReady = true;
         } else if (options.videoPath.empty()) {
             options.videoPath = arguments[index];
         }
@@ -1052,9 +1274,25 @@ CommandLineOptions ParseCommandLine() {
 int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int showCommand) {
     g_instance = instance;
     const CommandLineOptions commandLine = ParseCommandLine();
+
+    bool gpuPreferenceChanged = false;
+    HRESULT result = EnsureMinimumPowerGpuPreference(gpuPreferenceChanged);
+    if (FAILED(result)) {
+        ShowError(L"互換GPU設定を登録できなかった。", result);
+        return 1;
+    }
+    if (gpuPreferenceChanged && !commandLine.gpuPreferenceReady) {
+        result = RelaunchForGpuPreference();
+        if (FAILED(result)) {
+            ShowError(L"互換GPU設定の適用後に再起動できなかった。", result);
+            return 1;
+        }
+        return 0;
+    }
+
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
-    HRESULT result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     if (FAILED(result)) {
         ShowError(L"COMを初期化できなかった。", result);
         return 1;
