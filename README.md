@@ -8,6 +8,8 @@ Web表示、プラグイン、インタラクションを持たず、Windows標�
 
 [最新のRelease](https://github.com/drydeuterium/wallpaper-mp4/releases/latest)からWindows x64版ZIPをダウンロードして展開する。インストールは不要。
 
+NVIDIA/AMDまたはIntel/NVIDIAのハイブリッドGPUを搭載したノートPCで、通常版が再生時にクラッシュする、または音声だけ流れて映像が壁紙に表示されない場合は、[Laptop Edition](https://github.com/drydeuterium/wallpaper-mp4/releases/tag/v0.3.0-laptop.1)を使用する。
+
 コード署名は行っていないため、初回起動時にWindows SmartScreenが表示される場合がある。
 
 ## 使い方
